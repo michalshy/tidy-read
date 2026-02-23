@@ -1,47 +1,71 @@
-use axum::{Json, Router, routing::post};
+use axum::{Json, Router, http::StatusCode, routing::post};
+use readability_js::{Readability, ReadabilityError, ReadabilityOptions};
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
 struct Input {
-    text: String,
+    html: String,
+    #[serde(default)]
+    url: Option<String>,
 }
 
 #[derive(Serialize)]
 struct Output {
-    cleaned: String,
+    title: Option<String>,
+    author: Option<String>,
+    content: String,
+    text: String, // plain text
 }
 
-async fn clean_text(Json(input): Json<Input>) -> Json<Output> {
-    let prompt = format!(
-        "Remove all HTML tags, footnotes, stage directions, signatures and other noise from the following text. Return only clean content, nothing else:\n\n{}",
-        input.text
-    );
+#[derive(Serialize)]
+struct ErrorOutput {
+    error: String,
+}
 
-    let client = reqwest::Client::new();
-    let res = client
-        .post("http://localhost:11434/api/generate")
-        .json(&serde_json::json!({
-            "model": "qwen2.5:1.5b",
-            "prompt": prompt,
-            "stream": false,
-            "options": {
-                "temperature": 0,
-            }
-        }))
-        .send()
-        .await
-        .unwrap()
-        .json::<serde_json::Value>()
-        .await
-        .unwrap();
+async fn clean(Json(input): Json<Input>) -> Result<Json<Output>, (StatusCode, Json<ErrorOutput>)> {
+    let reader = Readability::new().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorOutput {
+                error: e.to_string(),
+            }),
+        )
+    })?;
 
-    let cleaned = res["response"].as_str().unwrap_or("").to_string();
-    Json(Output { cleaned })
+    let base_url = input.url.as_deref();
+
+    let article = reader
+        .parse_with_options(
+            &input.html,
+            base_url,
+            Some(ReadabilityOptions::new().char_threshold(100)),
+        )
+        .map_err(|e| {
+            let msg = match e {
+                ReadabilityError::ReadabilityCheckFailed => {
+                    "Failed to make readable text".to_string()
+                }
+                _ => e.to_string(),
+            };
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(ErrorOutput { error: msg }),
+            )
+        })?;
+
+    Ok(Json(Output {
+        title: Some(article.title),
+        author: article.byline,
+        content: article.content,
+        text: article.text_content, // plain text
+    }))
 }
 
 #[tokio::main]
 async fn main() {
-    let app = Router::new().route("/clean", post(clean_text));
+    let app = Router::new().route("/clean", post(clean));
+
+    println!("Server works on http://localhost:3000");
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
